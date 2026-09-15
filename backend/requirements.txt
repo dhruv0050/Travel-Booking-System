@@ -1,0 +1,9 @@
+langchain-core
+langchain-groq
+langgraph
+langgraph-checkpoint-postgres
+langchain-mcp-adapters
+psycopg[binary]
+python-dotenv
+fastapi
+uvicorn[standard]

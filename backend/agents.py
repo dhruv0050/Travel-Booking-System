@@ -328,6 +328,10 @@ Budget results:
 {state.get('budget_results', '')}
 
 Make the output structured, practical, and ready for human review.
+IMPORTANT FORMATTING RULES:
+- Do NOT use raw HTML tags such as <br> or <br/> anywhere, especially in tables.
+- Use standard clean markdown syntax with clean bullet points or clean comma-separated items.
+- Ensure day-by-day dates align precisely with any trip dates specified in the user request.
 """
 
     result = _llm_text(
@@ -385,33 +389,43 @@ def final_response_agent(state: TravelState):
     print("Feedback:", state.get("human_feedback"))
     print("=======================================\n")
 
-    if state["approved"]:
+    if state.get("approved", False):
         prompt = f"""
 The human approved this draft itinerary.
 
 Produce the final polished travel plan.
 
 Draft itinerary:
-{state['itinerary']}
+{state.get('itinerary', '')}
 
 Budget notes:
-{state['budget_results']}
+{state.get('budget_results', '')}
+
+IMPORTANT FORMATTING RULES:
+- Do NOT use raw HTML tags such as <br> or <br/> anywhere, especially in tables.
+- Use standard clean markdown syntax with clean bullet points or clean comma-separated items.
+- Ensure day-by-day dates align precisely with any trip dates specified in the draft.
 """
     else:
         prompt = f"""
 The human did not approve the draft.
 
 Original user request:
-{state['user_query']}
+{state.get('user_query', '')}
 
 Draft itinerary:
-{state['itinerary']}
+{state.get('itinerary', '')}
 
 Human feedback:
-{state['human_feedback']}
+{state.get('human_feedback', '')}
 
 Budget notes:
-{state['budget_results']}
+{state.get('budget_results', '')}
+
+IMPORTANT FORMATTING RULES:
+- Do NOT use raw HTML tags such as <br> or <br/> anywhere, especially in tables.
+- Use standard clean markdown syntax with clean bullet points or clean comma-separated items.
+- Ensure day-by-day dates align precisely with any trip dates specified in the user request.
 """
 
     result = _llm_text(
