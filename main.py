@@ -1,218 +1,122 @@
-#pip install aviationstack-mcp
-import os
-import sys
-from typing import TypedDict, Annotated
-import operator
-import asyncio
 import psycopg
-from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.postgres import PostgresSaver
-from langchain_core.messages import (
-    AnyMessage,
-    HumanMessage,
-    AIMessage,
-    SystemMessage,
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command
+
+from agents import (
+    budget_agent,
+    final_response_agent,
+    flight_agent,
+    hotel_agent,
+    human_approval_agent,
+    itinerary_agent,
+    supervisor_agent,
 )
+from config import DATABASE_URL
+from state import TravelState
 
-if sys.stdout and hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+AGENT_ORDER = [
+    "flight_agent",
+    "hotel_agent",
+    "budget_agent",
+    "itinerary_agent",
+]
 
-from langchain_groq import ChatGroq
-
-from mcp_client import (
-    tavily_mcp_search,
-    get_airports,
-    get_airlines,
-    aviation_mcp_call,
-    extract_destination,
-    get_flight_info,
-)
+ROUTE_MAP = {
+    "flight_agent": "flight_agent",
+    "hotel_agent": "hotel_agent",
+    "budget_agent": "budget_agent",
+    "itinerary_agent": "itinerary_agent",
+}
 
 
-from dotenv import load_dotenv
-load_dotenv(override=True)
-DATABASE_URL = os.getenv("DATABASE_URL")
+def _selected_agents(state: TravelState) -> list[str]:
+    selected = state.get("selected_agents")
+    return [agent for agent in AGENT_ORDER if agent in selected]  
 
-# LLM
-llm = ChatGroq(
-    model="openai/gpt-oss-120b"
-)
 
-# State
-class TravelState(TypedDict):
-    messages: Annotated[list[AnyMessage], operator.add]
-    user_query: str
-    flight_results: str
-    hotel_results: str
-    itinerary: str
-    llm_calls: int
-    weather_results: str
+def route_from_supervisor(state: TravelState) -> str:
+    selected = _selected_agents(state)
+    return selected[0] if selected else "itinerary_agent"
 
-# Flight Tool Router Prompt
-FLIGHT_AGENT_PROMPT = """
-You are a travel flight expert.
 
-User Query:
-{query}
 
-Airport Information:
-{airport_data}
+def route_after_agent(current_agent: str):
+    def route(state: TravelState) -> str:
+        selected = _selected_agents(state)
+        current_index = AGENT_ORDER.index(current_agent)
 
-Airline Information:
-{airline_data}
+        for next_agent in AGENT_ORDER[current_index + 1:]:
+            if next_agent in selected:
+                return next_agent
 
-Generate:
+        return "itinerary_agent"
 
-1. Likely departure airport
-2. Likely arrival airport
-3. Airlines serving this route
-4. Typical flight duration
-5. Estimated airfare range
-6. Peak season pricing warning
-7. Booking advice
-
-Return concise travel guidance.
-"""
-
-# Flight Agent
-def flight_agent(state: TravelState):
-    print("\nINSIDE FLIGHT AGENT\n")
-
-    query = state["user_query"]
-
-    try:
-
-        airports, airlines = asyncio.run(get_flight_info())
-
-        prompt = FLIGHT_AGENT_PROMPT.format(
-            query=query,
-            airport_data=str(airports)[:1000],
-            airline_data=str(airlines)[:1000]
-        )
-
-        response = llm.invoke([
-            SystemMessage(
-                content="You are an expert travel flight planner."
-            ),
-            HumanMessage(content=prompt)
-        ])
-
-        flight_data = response.content
-
-    except Exception as e:
-
-        flight_data = f"Flight information unavailable: {str(e)}"
-
-    return {
-        "flight_results": flight_data,
-        "messages": [
-            AIMessage(
-                content="Flight recommendations generated"
-            )
-        ],
-        "llm_calls": state.get("llm_calls", 0) + 1
-    }
+    return route
 
 
 
 
-# Hotel Agent
-def hotel_agent(state: TravelState):
-    query = f"Best hotels for {state['user_query']}"
+def build_graph():
+    graph = StateGraph(TravelState)
 
-    hotel_results = asyncio.run(
-        tavily_mcp_search(query)
+    graph.add_node("supervisor", supervisor_agent)
+    graph.add_node("flight_agent", flight_agent)
+    graph.add_node("hotel_agent", hotel_agent)
+    graph.add_node("budget_agent", budget_agent)
+    graph.add_node("itinerary_agent", itinerary_agent)
+    graph.add_node("human_approval", human_approval_agent)
+    graph.add_node("final_response", final_response_agent)
+
+    graph.add_edge(START, "supervisor")
+    graph.add_conditional_edges("supervisor", route_from_supervisor, ROUTE_MAP)
+    graph.add_conditional_edges("flight_agent", route_after_agent("flight_agent"), ROUTE_MAP)
+    graph.add_conditional_edges("hotel_agent", route_after_agent("hotel_agent"), ROUTE_MAP)
+    graph.add_conditional_edges("budget_agent", route_after_agent("budget_agent"), ROUTE_MAP)
+    graph.add_edge("itinerary_agent", "human_approval")
+    graph.add_edge("human_approval", "final_response")
+    graph.add_edge("final_response", END)
+
+    if DATABASE_URL:
+        conn = psycopg.connect(DATABASE_URL)
+        checkpointer = PostgresSaver(conn)
+        checkpointer.setup()
+        return graph.compile(checkpointer=checkpointer)
+
+    return graph.compile(checkpointer=MemorySaver())
+
+
+app = build_graph()
+
+
+def run():
+    query = input("What trip would you like to plan? ").strip()
+    if not query:
+        print("Please enter a travel request.")
+        return
+
+    config = {"configurable": {"thread_id": "local-travel-session"}}
+    result = app.invoke(
+        {"user_query": query, "messages": [], "llm_calls": 0},
+        config=config,
     )
 
-    return {
-        "hotel_results": str(hotel_results),
-        "messages": [
-            AIMessage(content="Hotel information fetched")
-        ],
-        "llm_calls": state.get("llm_calls", 0) + 1
-    }
+    while "__interrupt__" in result:
+        interrupt_value = result["__interrupt__"][0].value
+        print("\n" + interrupt_value["approval_request"])
+        approved = input("Approve this itinerary? [y/N] ").strip().lower() in {
+            "y",
+            "yes",
+        }
+        feedback = "" if approved else input("What should be changed? ").strip()
+        result = app.invoke(
+            Command(resume={"approved": approved, "feedback": feedback}),
+            config=config,
+        )
 
-
-# Itinerary Agent
-def itinerary_agent(state: TravelState):
-
-    flight_info = str(state.get("flight_results", ""))[:1200]
-    hotel_info = str(state.get("hotel_results", ""))[:1200]
-
-    prompt = f"""
-    Create a detailed travel itinerary based on the following query and research.
-
-    User Query:
-    {state['user_query']}
-
-    Flight Information:
-    {flight_info}
-
-    Hotel Information:
-    {hotel_info}
-    """
-
-    response = llm.invoke([
-        SystemMessage(
-            content="You are an expert travel planner."
-        ),
-        HumanMessage(content=prompt)
-    ])
-
-    return {
-        "itinerary": response.content,
-        "messages": [response],
-        "llm_calls": state.get("llm_calls", 0) + 1
-    }
-
-
-
-graph = StateGraph(TravelState)
-
-graph.add_node("flight_agent", flight_agent)
-graph.add_node("hotel_agent", hotel_agent)
-graph.add_node("itinerary_agent", itinerary_agent)
-
-
-graph.add_edge(START, "flight_agent")
-graph.add_edge("flight_agent", "hotel_agent")
-graph.add_edge("hotel_agent", "itinerary_agent")
-graph.add_edge("itinerary_agent", END)
-
-
-_conn = psycopg.connect(DATABASE_URL)
-checkpointer = PostgresSaver(_conn)
-checkpointer.setup()
-
-app = graph.compile(checkpointer=checkpointer)
+    print("\n" + result.get("final_response", "No final response was produced."))
 
 
 if __name__ == "__main__":
-    import uuid
-    config = {
-        "configurable": {
-            "thread_id": str(uuid.uuid4())
-        }
-    }
-
-
-    user_input = input("Enter travel request: ")
-
-    result = app.invoke(
-        {
-            "messages": [
-                HumanMessage(content=user_input)
-            ],
-            "user_query": user_input,
-            "flight_results": "",
-            "hotel_results": "",
-            "itinerary": "",
-            "llm_calls": 0
-        },
-        config=config
-    )
-
-    print("\nFINAL RESPONSE:\n")
-
-    for msg in result["messages"]:
-        print(msg.content)
+    run()

@@ -5,13 +5,15 @@ import sys
 
 from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient  # type: ignore[import-not-found]
-from langchain_groq import ChatGroq
+from config import get_llm
 
 load_dotenv()
 
 def create_mcp_client():
     tavily_api_key = os.getenv("TAVILY_API_KEY")
-    aviation_api_key = os.getenv("AVIATIONSTACK_API_KEY")
+    aviation_api_key = os.getenv("AVIATIONSTACK_API_KEY") or os.getenv(
+        "AVIATION_STACK_API_KEY"
+    )
     return MultiServerMCPClient(
         {
             "tavily": {
@@ -43,6 +45,10 @@ async def tavily_mcp_search(query: str):
     result = await search_tool.ainvoke({"query": query})
     return result
 
+
+async def tavily_search(query: str):
+    return await tavily_mcp_search(query)
+
 async def get_flight_info():
     client = create_mcp_client()
     tools = await client.get_tools()
@@ -73,6 +79,15 @@ async def get_airports():
         return "Airport tool unavailable"
     return await tool.ainvoke({})
 
+
+async def list_airports(destination: str = "", limit: int = 10):
+    client = create_mcp_client()
+    tools = await client.get_tools()
+    tool = next((t for t in tools if t.name == "list_airports"), None)
+    if not tool:
+        return "Airport tool unavailable"
+    return await tool.ainvoke({"query": destination, "limit": limit})
+
 async def get_airlines():
     client = create_mcp_client()
     tools = await client.get_tools()
@@ -81,10 +96,17 @@ async def get_airlines():
         return "Airline tool unavailable"
     return await tool.ainvoke({})
 
+
+async def list_airlines(query: str = "", limit: int = 10):
+    client = create_mcp_client()
+    tools = await client.get_tools()
+    tool = next((t for t in tools if t.name == "list_airlines"), None)
+    if not tool:
+        return "Airline tool unavailable"
+    return await tool.ainvoke({"query": query, "limit": limit})
+
 # LLM
-llm = ChatGroq(
-    model="openai/gpt-oss-120b"
-)
+llm = get_llm()
 
 def extract_destination(query: str):
     prompt = f"""
